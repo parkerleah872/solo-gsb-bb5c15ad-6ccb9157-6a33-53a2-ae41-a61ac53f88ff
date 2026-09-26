@@ -1,9 +1,10 @@
 'use strict';
 
 /* 全局状态：rows 为当前校订结果，结构：
- * { id, text, start, end, sim, oldRefs:[{index,text}], baseFlags:[], ack }
+ * { id, text, start, end, sim, oldRefs:[{index,text}], baseFlags:[], ack, locked, evenizeFail }
  * baseFlags 来自服务端（uncertain / unmatched），ack 后清除；
- * reversed / overlap 每次渲染前实时重算。
+ * reversed / overlap 每次渲染前实时重算；
+ * locked 为行内时码锁定开关（匀时时保持不动）；evenizeFail 标记最近一次匀时容量不足的区间。
  */
 const state = {
   rows: [],
@@ -93,8 +94,11 @@ $('#alignBtn').addEventListener('click', async () => {
       oldRefs: r.oldRefs || [],
       baseFlags: (r.flags || []).filter((f) => f === 'uncertain' || f === 'unmatched'),
       ack: false,
+      locked: false,
+      evenizeFail: false,
     }));
     state.droppedOld = data.droppedOld || [];
+    $('#evenizeMsg').classList.add('hidden');
     renderStats(data.stats);
     renderDropped();
     renderRows();
@@ -172,11 +176,28 @@ function buildRow(row, idx) {
   tr.dataset.id = row.id;
   if (row.flags.length) tr.classList.add('pending');
   if (row.ack) tr.classList.add('acked');
+  if (row.locked) tr.classList.add('locked');
+  if (row.evenizeFail) tr.classList.add('evenize-fail');
 
   // #
   const tdNo = document.createElement('td');
   tdNo.textContent = idx + 1;
   tr.appendChild(tdNo);
+
+  // 时码锁定
+  const tdLock = document.createElement('td');
+  tdLock.className = 'lock-col';
+  const lockCb = document.createElement('input');
+  lockCb.type = 'checkbox';
+  lockCb.checked = !!row.locked;
+  lockCb.title = row.locked ? '已锁定：匀时时保持本行时码不变' : '勾选后匀时时保持本行时码不变';
+  lockCb.addEventListener('change', () => {
+    row.locked = lockCb.checked;
+    row.evenizeFail = false;
+    renderRows();
+  });
+  tdLock.appendChild(lockCb);
+  tr.appendChild(tdLock);
 
   // 修订台词（可编辑）
   const tdText = document.createElement('td');
@@ -185,7 +206,7 @@ function buildRow(row, idx) {
   ta.rows = Math.min(3, Math.max(1, row.text.split('\n').length));
   ta.value = row.text;
   ta.spellcheck = false;
-  ta.addEventListener('input', () => { row.text = ta.value; });
+  ta.addEventListener('input', () => { row.text = ta.value; row.evenizeFail = false; });
   tdText.appendChild(ta);
   tr.appendChild(tdText);
 
@@ -221,6 +242,8 @@ function buildRow(row, idx) {
     input.className = 'time-input';
     input.value = formatMs(row[field]);
     input.dataset.field = field;
+    input.disabled = !!row.locked;
+    input.title = row.locked ? '该行时码已锁定，取消锁定后可编辑' : '';
     input.addEventListener('change', () => {
       const v = parseTimecode(input.value);
       if (v == null) {
@@ -229,6 +252,7 @@ function buildRow(row, idx) {
       }
       input.classList.remove('invalid');
       row[field] = v;
+      row.evenizeFail = false;
       input.value = formatMs(v);
       renderRows();
     });
@@ -294,7 +318,7 @@ function openSplitEditor(anchorTr, row) {
   const tr = document.createElement('tr');
   tr.className = 'split-editor';
   const td = document.createElement('td');
-  td.colSpan = 8;
+  td.colSpan = 9;
 
   const label = document.createElement('div');
   label.innerHTML = '在第 <input type="number"> 个字符后拆分（共 ' + text.length + ' 字）';
@@ -355,6 +379,8 @@ function doSplit(row, pos) {
     oldRefs: row.oldRefs,
     baseFlags: [...row.baseFlags],
     ack: row.ack,
+    locked: false,
+    evenizeFail: false,
   });
   state.rows.splice(idx, 1, mk(t1, s1, e1), mk(t2, s2, e2));
   renderRows();
@@ -379,10 +405,107 @@ function mergeWithNext(row) {
     oldRefs,
     baseFlags: [...new Set([...row.baseFlags, ...next.baseFlags])],
     ack: row.ack && next.ack,
+    locked: !!(row.locked && next.locked),
+    evenizeFail: false,
   };
   state.rows.splice(idx, 2, merged);
   renderRows();
 }
+
+/* ---------- 区间匀时 ---------- */
+
+function formatDur(ms) {
+  ms = Math.max(0, Math.round(ms));
+  if (ms >= 1000) {
+    const s = ms / 1000;
+    return `${s.toFixed(ms % 1000 === 0 ? 0 : 2).replace(/\.?0+$/, '')} 秒`;
+  }
+  return `${ms} 毫秒`;
+}
+
+function showEvenizeMsg(parts, kind) {
+  const box = $('#evenizeMsg');
+  box.classList.remove('hidden', 'ok', 'warn');
+  box.classList.add(kind);
+  box.innerHTML = '';
+  for (const p of parts) {
+    const div = document.createElement('div');
+    if (p instanceof Node) {
+      div.appendChild(p);
+    } else {
+      div.textContent = p;
+    }
+    box.appendChild(div);
+  }
+}
+
+function clearEvenizeMsg() {
+  const box = $('#evenizeMsg');
+  box.classList.add('hidden');
+  box.className = 'msg hidden';
+  box.innerHTML = '';
+}
+
+$('#evenizeBtn').addEventListener('click', async () => {
+  const btn = $('#evenizeBtn');
+  if (!state.rows.length) return;
+  const unlocked = state.rows.filter((r) => !r.locked).length;
+  if (!unlocked) {
+    showEvenizeMsg(['所有行均已锁定，没有可匀时的区间。'], 'warn');
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/evenize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rows: state.rows.map((r) => ({ start: r.start, end: r.end, text: r.text, locked: r.locked })),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '匀时失败');
+
+    state.rows.forEach((r, i) => {
+      const out = data.rows[i];
+      if (out && !r.locked) {
+        r.start = out.start;
+        r.end = out.end;
+      }
+      r.evenizeFail = false;
+    });
+    for (const f of data.failures) {
+      for (let i = f.from - 1; i <= f.to - 1; i++) {
+        if (state.rows[i]) state.rows[i].evenizeFail = true;
+      }
+    }
+
+    const parts = [];
+    if (data.updated > 0) {
+      parts.push(`已匀时 ${data.updated} 个区间、共 ${data.updatedRows} 行（按可见字数分配，单行 ≥ 400ms、行间 ≥ 100ms）。`);
+    } else {
+      parts.push('没有可更新的区间。');
+    }
+    if (data.failures.length) {
+      for (const f of data.failures) {
+        const lineTxt = f.from === f.to ? `第 ${f.from} 行` : `第 ${f.from}–${f.to} 行`;
+        const span = document.createElement('span');
+        span.textContent =
+          `${lineTxt} 容量不足：需要 ${formatDur(f.required)}，可用 ${formatDur(f.available)}，已保留原时码。`;
+        parts.push(span);
+      }
+    }
+    showEvenizeMsg(parts, data.failures.length ? 'warn' : 'ok');
+    renderRows();
+    if (data.failures.length) {
+      $('#rowsBody').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  } catch (err) {
+    showEvenizeMsg([err.message], 'warn');
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 /* ---------- 导出 / 预览 / 下载 ---------- */
 

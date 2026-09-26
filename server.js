@@ -4,6 +4,7 @@ const path = require('path');
 const express = require('express');
 const { parseSrt, serializeSrt } = require('./src/srt');
 const { alignRevised } = require('./src/align');
+const { evenize } = require('./src/evenize');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 8080;
@@ -76,6 +77,45 @@ app.post('/api/export', (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`字幕校订工具已启动: http://localhost:${PORT}`);
+/**
+ * 区间匀时：按锁定行切分连续未锁定行，按可见字符数加权重排时码。
+ * 入参与 /api/export 一致的 rows（另带 locked），返回更新后的时码与容量不足区间。
+ */
+app.post('/api/evenize', (req, res) => {
+  try {
+    const { rows } = req.body || {};
+    if (!Array.isArray(rows) || !rows.length) {
+      return res.status(400).json({ error: '没有可匀时的行' });
+    }
+    const work = rows.map((r, idx) => {
+      const start = Number(r.start);
+      const end = Number(r.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0) {
+        throw new Error(`第 ${idx + 1} 行时码无效`);
+      }
+      return {
+        start: Math.round(start),
+        end: Math.round(end),
+        text: String(r.text == null ? '' : r.text),
+        locked: !!r.locked,
+      };
+    });
+    const report = evenize(work);
+    res.json({
+      rows: work.map((r) => ({ start: r.start, end: r.end, locked: r.locked })),
+      updated: report.updated,
+      updatedRows: report.updatedRows,
+      failures: report.failures,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`字幕校订工具已启动: http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
