@@ -1,9 +1,10 @@
 'use strict';
 
 /* 全局状态：rows 为当前校订结果，结构：
- * { id, text, start, end, sim, oldRefs:[{index,text}], baseFlags:[], ack }
+ * { id, text, start, end, sim, oldRefs:[{index,text}], baseFlags:[], ack, locked }
  * baseFlags 来自服务端（uncertain / unmatched），ack 后清除；
- * reversed / overlap 每次渲染前实时重算。
+ * reversed / overlap 每次渲染前实时重算；
+ * locked 为时码锁定，「区间匀时」只重排未锁定行。
  */
 const state = {
   rows: [],
@@ -93,6 +94,7 @@ $('#alignBtn').addEventListener('click', async () => {
       oldRefs: r.oldRefs || [],
       baseFlags: (r.flags || []).filter((f) => f === 'uncertain' || f === 'unmatched'),
       ack: false,
+      locked: false,
     }));
     state.droppedOld = data.droppedOld || [];
     renderStats(data.stats);
@@ -172,6 +174,7 @@ function buildRow(row, idx) {
   tr.dataset.id = row.id;
   if (row.flags.length) tr.classList.add('pending');
   if (row.ack) tr.classList.add('acked');
+  if (row.locked) tr.classList.add('locked');
 
   // #
   const tdNo = document.createElement('td');
@@ -236,6 +239,21 @@ function buildRow(row, idx) {
     tr.appendChild(td);
   }
 
+  // 锁定（区间匀时不改动锁定行的时码）
+  const tdLock = document.createElement('td');
+  const lockBtn = document.createElement('button');
+  lockBtn.className = 'small lock-btn' + (row.locked ? ' locked' : '');
+  lockBtn.textContent = row.locked ? '🔒' : '🔓';
+  lockBtn.title = row.locked
+    ? '已锁定：区间匀时不会改动本行时码（点击解锁）'
+    : '未锁定：点击锁定本行时码，作为区间匀时的边界';
+  lockBtn.addEventListener('click', () => {
+    row.locked = !row.locked;
+    renderRows();
+  });
+  tdLock.appendChild(lockBtn);
+  tr.appendChild(tdLock);
+
   // 标记
   const tdFlags = document.createElement('td');
   for (const f of row.flags) {
@@ -294,7 +312,7 @@ function openSplitEditor(anchorTr, row) {
   const tr = document.createElement('tr');
   tr.className = 'split-editor';
   const td = document.createElement('td');
-  td.colSpan = 8;
+  td.colSpan = 9;
 
   const label = document.createElement('div');
   label.innerHTML = '在第 <input type="number"> 个字符后拆分（共 ' + text.length + ' 字）';
@@ -355,6 +373,7 @@ function doSplit(row, pos) {
     oldRefs: row.oldRefs,
     baseFlags: [...row.baseFlags],
     ack: row.ack,
+    locked: row.locked,
   });
   state.rows.splice(idx, 1, mk(t1, s1, e1), mk(t2, s2, e2));
   renderRows();
@@ -379,10 +398,48 @@ function mergeWithNext(row) {
     oldRefs,
     baseFlags: [...new Set([...row.baseFlags, ...next.baseFlags])],
     ack: row.ack && next.ack,
+    locked: row.locked || next.locked,
   };
   state.rows.splice(idx, 2, merged);
   renderRows();
 }
+
+/* ---------- 区间匀时 ---------- */
+
+$('#evenBtn').addEventListener('click', () => {
+  const msg = $('#evenMsg');
+  msg.className = 'msg';
+  if (!state.rows.length) {
+    msg.textContent = '没有可匀时的行';
+    return;
+  }
+  if (state.rows.every((r) => r.locked)) {
+    msg.textContent = '所有行均已锁定，没有可匀时的行';
+    return;
+  }
+  const { applied, failures } = window.EvenTiming.evenOutRows(state.rows);
+  renderRows(); // 重算重叠等标记，预览/导出沿用更新后的时码
+  const parts = [];
+  if (applied.length) {
+    parts.push(`已匀时 ${applied.length} 个区间（${applied.reduce((s, a) => s + a.to - a.from + 1, 0)} 行）`);
+  }
+  if (failures.length) {
+    parts.push(
+      failures
+        .map((f) => {
+          const range = f.from === f.to ? `第 ${f.from} 行` : `第 ${f.from}–${f.to} 行`;
+          return `${range}容量不足：需要 ${f.requiredMs} 毫秒，可用 ${f.availableMs} 毫秒，已保留原时码`;
+        })
+        .join('；')
+    );
+  }
+  if (!parts.length) {
+    msg.textContent = '没有需要匀时的区间';
+    return;
+  }
+  msg.className = failures.length ? 'msg' : 'msg ok';
+  msg.textContent = parts.join('；');
+});
 
 /* ---------- 导出 / 预览 / 下载 ---------- */
 

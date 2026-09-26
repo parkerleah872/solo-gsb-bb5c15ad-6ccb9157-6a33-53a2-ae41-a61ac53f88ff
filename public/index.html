@@ -44,7 +44,9 @@
       <div id="statsBar" class="stats"></div>
       <div class="toolbar">
         <label><input type="checkbox" id="pendingOnly"> 仅看待处理行</label>
-        <span class="hint">提示：可修改台词文本与时码；「拆分」把一行拆成两行并按长度分配时段；「合并」与下一行并成一条并沿用覆盖时段；带标记的行确认无误后点「确认」。</span>
+        <button id="evenBtn" title="在锁定行之间按可见字数重排未锁定行的时码">区间匀时</button>
+        <span id="evenMsg" class="msg"></span>
+        <span class="hint">提示：可修改台词文本与时码；「锁定」的行时码固定，作为匀时边界；「区间匀时」对每段连续未锁定行按可见字数分配时长（单行≥400ms、行间≥100ms），容量不足的区间保留原时码；「拆分」把一行拆成两行；「合并」与下一行并成一条；带标记的行确认无误后点「确认」。</span>
       </div>
       <div class="table-wrap">
         <table id="rowsTable">
@@ -56,6 +58,7 @@
               <th>相似度</th>
               <th>开始</th>
               <th>结束</th>
+              <th>锁定</th>
               <th>标记</th>
               <th>操作</th>
             </tr>
@@ -86,6 +89,7 @@
   </main>
 
   <footer>本地运行 · 数据不出本机</footer>
+  <script src="even.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
